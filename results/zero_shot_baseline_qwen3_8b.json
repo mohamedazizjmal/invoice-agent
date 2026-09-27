@@ -1,0 +1,112 @@
+{
+  "model": "Qwen3-8B (unsloth, 4-bit, zero-shot, un-tuned)",
+  "eval_jsonl": "/content/drive/MyDrive/invoice-agent/dataset_full/test.jsonl",
+  "n_examples": 30,
+  "timestamp": "2026-09-27T16:16:29.405381",
+  "summary": {
+    "invoice_number": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 30,
+      "fp": 0,
+      "fn": 0
+    },
+    "issue_date": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 30,
+      "fp": 0,
+      "fn": 0
+    },
+    "vendor_name": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 30,
+      "fp": 0,
+      "fn": 0
+    },
+    "vendor_tax_id": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 30,
+      "fp": 0,
+      "fn": 0
+    },
+    "subtotal": {
+      "precision": 0.23333333333333334,
+      "recall": 0.23333333333333334,
+      "f1": 0.23333333333333334,
+      "tp": 7,
+      "fp": 23,
+      "fn": 23
+    },
+    "vat_rate": {
+      "precision": 1.0,
+      "recall": 1.0,
+      "f1": 1.0,
+      "tp": 30,
+      "fp": 0,
+      "fn": 0
+    },
+    "vat_amount": {
+      "precision": 0.3,
+      "recall": 0.3,
+      "f1": 0.3,
+      "tp": 9,
+      "fp": 21,
+      "fn": 21
+    },
+    "grand_total": {
+      "precision": 0.26666666666666666,
+      "recall": 0.26666666666666666,
+      "f1": 0.26666666666666666,
+      "tp": 8,
+      "fp": 22,
+      "fn": 22
+    },
+    "currency": {
+      "precision": 0.7333333333333333,
+      "recall": 0.7333333333333333,
+      "f1": 0.7333333333333333,
+      "tp": 22,
+      "fp": 8,
+      "fn": 8
+    },
+    "description": {
+      "precision": 0.8541666666666666,
+      "recall": 0.8541666666666666,
+      "f1": 0.8541666666666666,
+      "tp": 82,
+      "fp": 14,
+      "fn": 14
+    },
+    "quantity": {
+      "precision": 0.9791666666666666,
+      "recall": 0.9791666666666666,
+      "f1": 0.9791666666666666,
+      "tp": 94,
+      "fp": 2,
+      "fn": 2
+    },
+    "unit_price": {
+      "precision": 0.19791666666666666,
+      "recall": 0.19791666666666666,
+      "f1": 0.19791666666666666,
+      "tp": 19,
+      "fp": 77,
+      "fn": 77
+    },
+    "line_total": {
+      "precision": 0.17708333333333334,
+      "recall": 0.17708333333333334,
+      "f1": 0.17708333333333334,
+      "tp": 17,
+      "fp": 79,
+      "fn": 79
+    }
+  }
+}
