@@ -2,7 +2,7 @@
   "model": "Qwen3-8B (unsloth, 4-bit, zero-shot, un-tuned)",
   "eval_jsonl": "/content/drive/MyDrive/invoice-agent/dataset_full/test.jsonl",
   "n_examples": 30,
-  "timestamp": "2026-09-27T16:16:29.405381",
+  "timestamp": "2026-09-27T18:25:37.261890",
   "summary": {
     "invoice_number": {
       "precision": 1.0,
