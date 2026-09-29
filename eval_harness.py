@@ -20,6 +20,7 @@ transformers + Unsloth installed (see qwen_predict_fn below).
 
 import argparse
 import json
+import os
 import random
 import re
 import difflib
@@ -57,6 +58,9 @@ Règles :
 - Si un champ est absent ou illisible, mets la valeur null.
 - Les nombres doivent être des nombres JSON (pas de chaînes, pas de séparateurs de milliers).
 - vat_rate est un taux décimal (19% -> 0.19).
+- Les nombres du texte source utilisent l'espace comme séparateur de milliers et le
+  point comme séparateur décimal (exemple : 19 286.595 signifie 19286.595, PAS
+  19286595). Conserve toujours le point décimal, ne le supprime jamais.
 - N'invente aucune valeur qui n'apparaît pas dans le texte.
 
 JSON:"""
@@ -380,6 +384,69 @@ def run_eval(jsonl_path, predict_fn, limit=None, seed=42):
         ci = bootstrap_field_recall_ci(all_counts, f)
         ci_str = f"[{ci['ci_lo']:.2f}, {ci['ci_hi']:.2f}]" if ci else "n/a"
         print(f"{f:<18}{s['precision']:>10.3f}{s['recall']:>10.3f}{s['f1']:>10.3f}   {ci_str}")
+
+    return summary, all_counts
+
+
+def run_eval_resumable(jsonl_path, predict_fn, cache_path, limit=None):
+    """Checkpointed version of run_eval: each record's raw model output is
+    saved to cache_path (JSONL) as soon as it's generated, and a rerun
+    skips any record_id already cached -- safe to interrupt at any point."""
+    records = []
+    with open(jsonl_path, encoding="utf-8") as f:
+        for line in f:
+            records.append(json.loads(line))
+    if limit:
+        records = records[:limit]
+
+    cached = {}
+    if os.path.exists(cache_path):
+        with open(cache_path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entry = json.loads(line)
+                cached[entry["record_id"]] = entry["raw_pred"]
+        print(f"Resuming: {len(cached)} records already cached at {cache_path}")
+
+    n_new = 0
+    with open(cache_path, "a", encoding="utf-8") as out_f:
+        for i, rec in enumerate(records):
+            rid = rec["labels"]["record_id"]
+            if rid in cached:
+                continue
+            raw = predict_fn(rec["ocr_text"])
+            out_f.write(json.dumps({"record_id": rid, "raw_pred": raw}, ensure_ascii=False) + "\n")
+            out_f.flush()
+            os.fsync(out_f.fileno())
+            cached[rid] = raw
+            n_new += 1
+            print(f"[{i+1}/{len(records)}] {rid} generated", end="\r")
+
+    print(f"\nGenerated {n_new} new predictions this run ({len(records) - n_new} were already cached).")
+
+    all_counts = []
+    parse_failures = 0
+    for rec in records:
+        rid = rec["labels"]["record_id"]
+        raw = cached.get(rid)
+        pred = extract_json(raw) if isinstance(raw, str) else None
+        if pred is None:
+            parse_failures += 1
+        counts = score_record(rec["labels"], pred)
+        all_counts.append(counts)
+
+    summary = aggregate_counts(all_counts)
+    print(f"\n{len(records)} records evaluated. JSON parse failures: {parse_failures} "
+          f"({100*parse_failures/len(records):.1f}%)")
+    print(f"\n{'Field':<18}{'Precision':>10}{'Recall':>10}{'F1':>10}   Recall 95% CI")
+    print("-" * 70)
+    for fld in SCALAR_FIELDS + LINE_ITEM_SUBFIELDS:
+        s = summary[fld]
+        ci = bootstrap_field_recall_ci(all_counts, fld)
+        ci_str = f"[{ci['ci_lo']:.2f}, {ci['ci_hi']:.2f}]" if ci else "n/a"
+        print(f"{fld:<18}{s['precision']:>10.3f}{s['recall']:>10.3f}{s['f1']:>10.3f}   {ci_str}")
 
     return summary, all_counts
 
