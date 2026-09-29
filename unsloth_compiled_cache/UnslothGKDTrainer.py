@@ -1,6 +1,6 @@
 """
-2026.9.7
-2026.9.11
+2026.9.8
+2026.9.12
 5.5.0
 0.24.0
 __UNSLOTH_VERSIONING__
@@ -30,7 +30,7 @@ from unsloth_zoo.temporary_patches.common import torch_compile
 from unsloth_zoo.temporary_patches.common import _maybe_compile
 import functools
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, empty_cache, nn, os, prepare_deepspeed, random, textwrap, torch, unwrap_model_for_generation, warnings, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, nn, os, prepare_deepspeed, torch, warnings)
+from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, empty_cache, nn, os, prepare_deepspeed, random, textwrap, torch, unwrap_model_for_generation, warnings, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, nn, os, prepare_deepspeed, torch, warnings, F, empty_cache, os, torch)
 
 
 import os
@@ -405,7 +405,8 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -422,6 +423,486 @@ def sanitize_logprob(logprob):
         )
         return None
     return value
+def _unsloth_get_model_config(model):
+    """Return HuggingFace model config, unwrapping DDP/Accelerate wrappers."""
+    config = getattr(model, "config", None)
+    if config is None and hasattr(model, "module"):
+        config = getattr(model.module, "config", None)
+    return config
+
+def _unsloth_text_configs(config):
+    """``config`` and its text sub-config, the two places a transform can live: Gemma-4-style configs keep it on ``config.text_config``, T5Gemma-style ones only reach it via ``config.get_text_config()``."""
+    if config is None:
+        return []
+    holders = [config]
+    text_cfg = getattr(config, "text_config", None)
+    if text_cfg is None:
+        get_text_config = getattr(config, "get_text_config", None)
+        if callable(get_text_config):
+            try:
+                text_cfg = get_text_config()
+            except (TypeError, ValueError):
+                text_cfg = None
+    if text_cfg is not None and text_cfg is not config:
+        holders.append(text_cfg)
+    return holders
+
+def _unsloth_get_final_logit_softcapping(model):
+    """The soft cap the loss applies, under any of its three spellings: ``final_logit_softcapping`` (Gemma), ``logits_soft_cap`` (RecurrentGemma), ``output_logit_soft_cap`` (xLSTM). Returns 0 if unset."""
+    config = _unsloth_get_model_config(model)
+    if config is None:
+        return 0
+    for holder in _unsloth_text_configs(config):
+        for name in ("final_logit_softcapping", "logits_soft_cap", "output_logit_soft_cap"):
+            softcap = getattr(holder, name, None)
+            if softcap:
+                return softcap
+    return 0
+
+def _unsloth_resolve_logit_scales(model_config):
+    """``(multiply, divide)`` for the logits, read with the same field table and per-family overrides ``detect_logit_transforms`` uses.
+
+    Only reached when the installed unsloth_zoo predates that helper. Must stay in step with ``resolve_logit_transforms`` in unsloth/models/llama.py: if the forward applies a transform GRPO does not, the policy log-probabilities come from different logits than the ones generated, which silently shifts every importance ratio.
+    """
+    # ``logits_scaling`` is not one knob: Granite divides, HyperCLOVA X multiplies (MuP),
+    # MiniCPM3 scales the hidden states so it is not a logit transform.
+    overrides = {
+        ("logits_scaling", "hyperclovax"): "multiply",
+        ("logits_scaling", "minicpm3"): None,
+    }
+    found = {"multiply": 0, "divide": 0}
+    for holder in _unsloth_text_configs(model_config):
+        model_type = getattr(holder, "model_type", "") or ""
+        for bucket, names in (
+            ("multiply", ("logit_scale", "lm_head_multiplier", "output_multiplier")),
+            ("divide", ("logits_scaling",)),
+        ):
+            for name in names:
+                target = overrides.get((name, model_type), bucket)
+                if target is None or found[target]:
+                    continue
+                value = getattr(holder, name, 0) or 0
+                if value:
+                    found[target] = value
+                    break
+    return found["multiply"], found["divide"]
+
+def _unsloth_grpo_returns_hidden_states(model, tensor, lm_head):
+    """Does ``tensor`` (a forward's ``.logits``) carry hidden states or real logits?
+
+    ``_get_per_token_logps_and_entropies`` sets ``UNSLOTH_RETURN_HIDDEN_STATES=1``, but only a forward that honours the name hands hidden states back as ``.logits``; any other forward returns a real ``[.., vocab]`` tensor that must not reach the ``lm_head`` matmul.
+
+    The primary test is an explicit signal that the forward honours the flag, both set outside this file: ``__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__`` on the generated class, written by ``unsloth_zoo.compiler.create_standalone_class`` exactly when ``apply_fused_lm_head`` gave that forward its own branch; and ``_unsloth_grpo_hidden_states_forward_wrapped``, set by ``_install_grpo_hidden_states_forward_wrapper`` in ``unsloth/models/rl.py`` for models the compiler did not rewrite. That wrapper degrades to real logits when the model cannot produce hidden states and records whether it did so in ``_unsloth_grpo_hidden_states_degraded`` before returning, so reading the pair after a forward describes the call that just finished; degradation is per call, not per model.
+
+    The width comparison stays as the fallback, for an ``unsloth_zoo`` old enough that it never writes the marker. It is decisive whenever ``vocab_size != hidden_size``, and the signal may only overrule it when it is not, which is the one case the shape cannot answer.
+    """
+    if tensor.shape[-1] != lm_head.shape[1]:
+        return False  # vocab-wide: real logits, whatever any signal claims
+    if lm_head.shape[0] != lm_head.shape[1]:
+        return True  # hidden-wide and vocab_size != hidden_size: hidden states
+    return _unsloth_grpo_hidden_states_signal(model) is not False
+
+def _unsloth_grpo_hidden_states_signal(model):
+    """``True``/``False`` if the forward honours ``UNSLOTH_RETURN_HIDDEN_STATES``, ``None`` when neither marker is present. See ``_unsloth_grpo_returns_hidden_states`` for where each marker is set. Walks the wrapper chain because the markers are set on whichever object the trainer saw, which may be the DDP module or the PEFT base model rather than the object handed to the logprob loop."""
+    candidates = []
+    pending = [model]
+    while pending and len(candidates) < 8:
+        candidate = pending.pop(0)
+        if candidate is None or any(candidate is seen for seen in candidates):
+            continue
+        candidates.append(candidate)
+        get_base_model = getattr(candidate, "get_base_model", None)
+        if callable(get_base_model):
+            try:
+                pending.append(get_base_model())
+            except Exception:
+                pass
+        for _attr in ("module", "base_model", "model"):
+            child = getattr(candidate, _attr, None)
+            if child is not None and hasattr(child, "forward"):
+                pending.append(child)
+    for candidate in candidates:
+        if getattr(candidate, "__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__", False):
+            return True
+        if getattr(type(candidate), "__UNSLOTH_SUPPORTS_RETURN_HIDDEN_STATES__", False):
+            return True
+    if any(
+        getattr(candidate, "_unsloth_grpo_hidden_states_forward_wrapped", False)
+        for candidate in candidates
+    ):
+        # The wrapper honours the flag unless it recorded that this call could not.
+        if any(
+            hasattr(candidate, "_unsloth_grpo_hidden_states_degraded") for candidate in candidates
+        ):
+            return not any(
+                getattr(candidate, "_unsloth_grpo_hidden_states_degraded", False)
+                for candidate in candidates
+            )
+        # An unsloth/models/rl.py predating the per-call attribute set only the warn-once flag; it is the best signal such a wrapper offers.
+        return not any(
+            getattr(candidate, "_unsloth_grpo_hidden_states_warning_issued", False)
+            for candidate in candidates
+        )
+    return None
+
+def _unsloth_gkd_canonical(source):
+    """``ast.unparse`` without docstrings/comments so checks survive reformatting; ``None`` if unparsable."""
+    import ast as _ast
+    import textwrap as _textwrap
+
+    try:
+        tree = _ast.parse(_textwrap.dedent(source))
+    except Exception:
+        return None
+    for node in _ast.walk(tree):
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)) and node.body:
+            first = node.body[0]
+            if (
+                isinstance(first, _ast.Expr)
+                and isinstance(getattr(first, "value", None), _ast.Constant)
+                and isinstance(first.value.value, str)
+            ):
+                node.body = node.body[1:] or [_ast.Pass()]
+    try:
+        return _ast.unparse(tree)
+    except Exception:
+        return None
+
+def _unsloth_gkd_jsd_supported(trainer_class):
+    """Is ``trainer_class.generalized_jsd_loss`` one of TRL's own generalized JSDs, unchanged? Overrides keep the dense loss."""
+    cache = trainer_class.__dict__.get("_unsloth_gkd_jsd_supported_cache", None)
+    if cache is not None:
+        return cache
+    required = (
+        "student_logits = student_logits / temperature",
+        "teacher_logits = teacher_logits / temperature",
+        "student_log_probs = F.log_softmax(student_logits, dim=-1)",
+        "teacher_log_probs = F.log_softmax(teacher_logits, dim=-1)",
+        "if beta == 0:",
+        "jsd = F.kl_div(student_log_probs, teacher_log_probs, reduction='none', log_target=True)",
+        "elif beta == 1:",
+        "jsd = F.kl_div(teacher_log_probs, student_log_probs, reduction='none', log_target=True)",
+        "kl_teacher = F.kl_div(mixture_log_probs, teacher_log_probs, reduction='none', log_target=True)",
+        "kl_student = F.kl_div(mixture_log_probs, student_log_probs, reduction='none', log_target=True)",
+        "jsd = beta * kl_teacher + (1 - beta) * kl_student",
+        "mask = labels != -100",
+        "jsd = jsd[mask]",
+        "if reduction == 'batchmean':",
+    )
+    known = set(required) | {
+        "@staticmethod",
+        "def generalized_jsd_loss(student_logits, teacher_logits, labels=None, beta=0.5, temperature=1.0, reduction='batchmean'):",
+        "def generalized_jsd_loss(student_logits, teacher_logits, labels=None, beta=0.5, temperature=1.0, reduction='batchmean', num_items_in_batch=None):",
+        "else:",
+        "if labels is not None:",
+        "beta = torch.tensor(beta, dtype=student_log_probs.dtype)",
+        "beta = torch.tensor(beta, dtype=student_log_probs.dtype, device=student_log_probs.device)",
+        "mixture_log_probs = torch.logsumexp(torch.stack([student_log_probs + torch.log(1 - beta), teacher_log_probs + torch.log(beta)]), dim=0)",
+        "mixture_log_probs = torch.logsumexp(torch.stack([student_log_probs + torch.log1p(-beta), teacher_log_probs + torch.log(beta)]), dim=0)",
+        "if num_items_in_batch is not None:",
+        "jsd_sum = jsd.sum()",
+        "if isinstance(num_items_in_batch, torch.Tensor):",
+        "num_items_in_batch = num_items_in_batch.to(jsd_sum.device)",
+        "return jsd_sum / num_items_in_batch",
+        "return jsd.sum() / mask.sum() if labels is not None else jsd.sum() / (jsd.size(0) * jsd.size(1))",
+        "return jsd.sum() / mask.sum() if labels is not None else jsd.sum() / jsd.size(0)",
+        "denom = mask.sum().clamp_min(1) if labels is not None else max(jsd.size(0), 1)",
+        "return jsd.sum() / denom",
+        "elif reduction == 'sum':",
+        "return jsd.sum()",
+        "elif reduction == 'mean':",
+        "return jsd.mean()",
+        "return jsd",
+    }
+    ok = False
+    try:
+        source = _unsloth_gkd_canonical(inspect.getsource(trainer_class.generalized_jsd_loss))
+        lines = [line.strip() for line in source.splitlines() if line.strip()]
+        signature = next((line for line in lines if line.startswith("def ")), "")
+        ok = (
+            all(line in known for line in lines)
+            and all(line in lines for line in required)
+            # a num_items_in_batch parameter must come with its reduction, and vice versa
+            and (
+                ("num_items_in_batch=None" in signature)
+                == ("return jsd_sum / num_items_in_batch" in lines)
+            )
+        )
+    except Exception:
+        ok = False
+    try:
+        setattr(trainer_class, "_unsloth_gkd_jsd_supported_cache", ok)
+    except Exception:
+        pass
+    return ok
+
+def _unsloth_gkd_note_fallback(trainer, reason):
+    """Count why the chunked path declined (``trainer._unsloth_gkd_chunked_fallbacks``), log each reason once."""
+    try:
+        fallbacks = trainer.__dict__.setdefault("_unsloth_gkd_chunked_fallbacks", {})
+    except Exception:
+        return None
+    if reason not in fallbacks:
+        try:
+            from unsloth_zoo.log import logger as _gkd_logger
+            _gkd_logger.info(
+                f"Unsloth: GKD chunked JSD not used ({reason}); using TRL's dense loss."
+            )
+        except Exception:
+            pass
+    fallbacks[reason] = fallbacks.get(reason, 0) + 1
+    return None
+
+def _unsloth_gkd_dense_head(model):
+    """The output head when it is a plain dense ``[vocab, hidden]`` projection the chunked loss can read directly.
+    Rejects bnb heads (``nn.Linear`` subclasses with packed weights), PEFT heads and ZeRO-3 partitioned weights.
+    """
+    get_output_embeddings = getattr(model, "get_output_embeddings", None)
+    if not callable(get_output_embeddings):
+        return None
+    try:
+        head = get_output_embeddings()
+    except Exception:
+        return None
+    if type(head) is not torch.nn.Linear:
+        return None
+    # An lm_head that is not the output embeddings runs before them (ModernBERT decoder, RoBERTa-style heads).
+    lm_head = getattr(model, "lm_head", None)
+    if isinstance(lm_head, torch.nn.Module) and lm_head is not head:
+        return None
+    weight = getattr(head, "weight", None)
+    if not isinstance(weight, torch.Tensor) or weight.dim() != 2 or weight.numel() == 0:
+        return None
+    if weight.dtype not in (torch.float16, torch.bfloat16, torch.float32, torch.float64):
+        return None
+    if type(weight) not in (torch.Tensor, torch.nn.Parameter):
+        return None
+    bias = getattr(head, "bias", None)
+    if bias is not None and (bias.dim() != 1 or bias.shape[0] != weight.shape[0]):
+        return None
+    if weight.is_meta or (bias is not None and bias.is_meta):
+        return None
+    return head
+
+def _unsloth_gkd_logit_transforms(model):
+    """``(scale, softcap)`` exactly as the model's own forward applies them to its logits."""
+    model_config = _unsloth_get_model_config(model)
+    if detect_logit_transforms is not None:
+        _transforms = detect_logit_transforms(model_config)
+        logit_softcapping = _transforms["logit_softcapping"]
+        logit_scale_multiply = _transforms["logit_scale_multiply"]
+        logit_scale_divide = _transforms["logit_scale_divide"]
+    else:
+        logit_softcapping = _unsloth_get_final_logit_softcapping(model)
+        logit_scale_multiply, logit_scale_divide = _unsloth_resolve_logit_scales(model_config)
+    scale = 1.0
+    if logit_scale_multiply:
+        scale = scale * float(logit_scale_multiply)
+    if logit_scale_divide:
+        scale = scale / float(logit_scale_divide)
+    return scale, float(logit_softcapping or 0.0)
+
+def _unsloth_gkd_project(hidden_states, head, scale, softcap):
+    """Full logits from hidden states, for the rare call where only one of the two forwards honoured the flag."""
+    hidden_states = hidden_states.to(device = head.weight.device, dtype = head.weight.dtype)
+    logits = torch.nn.functional.linear(hidden_states, head.weight, head.bias)
+    if scale != 1.0:
+        logits = logits * scale
+    if softcap:
+        logits = softcap * torch.tanh(logits / softcap)
+    return logits
+
+def _unsloth_gkd_chunk_size(vocab_size):
+    """Rows per chunk: ``UNSLOTH_GKD_CHUNK_SIZE`` when set, else about 2**26 logits per chunk, bounded to [64, 1024]."""
+    requested = os.environ.get("UNSLOTH_GKD_CHUNK_SIZE", "")
+    if requested.strip().isdigit() and int(requested) > 0:
+        return int(requested)
+    rows = (1 << 26) // max(int(vocab_size), 1)
+    return int(min(1024, max(64, 1 << (max(rows, 1).bit_length() - 1))))
+
+def _unsloth_gkd_right_align(
+    inputs,
+    layout,
+    liger = False,
+):
+    """Roll left-padded rows (TRL's ChatML collator and generate both left-pad) so they start at column 0: Unsloth's training forward drops the 2D mask (#11885).
+    The prompt layout's ``[:, P:]`` slice becomes ``labels[:, :P] = -100`` plus a one-column ``prompts``; TRL's Liger branch scores every label with no slice, so it only rolls.
+    """
+    try:
+        attention_mask = inputs["attention_mask"]
+        left_pad = (attention_mask.cumsum(dim = 1) == 0).sum(dim = 1, keepdim = True)
+    except Exception:
+        return inputs
+    if not bool(left_pad.any()):
+        return inputs
+    aligned = dict(inputs)
+    labels = inputs["labels"]
+    if layout["shift"] == "prompt" and not liger:
+        labels = labels.clone()
+        labels[:, : inputs["prompts"].shape[1]] = -100
+        aligned["prompts"] = inputs["prompts"][:, :1]
+    width = attention_mask.shape[1]
+    index = (torch.arange(width, device = attention_mask.device).unsqueeze(0) + left_pad) % width
+    for key, value in (
+        ("input_ids", inputs["input_ids"]),
+        ("attention_mask", attention_mask),
+        ("labels", labels),
+    ):
+        aligned[key] = value.gather(1, index)
+    return aligned
+
+def _unsloth_gkd_chunked_loss(self, model, inputs, num_items_in_batch, layout):
+    """TRL's GKD loss without either full logits tensor, or ``None`` to run TRL's own ``compute_loss``."""
+    if layout is None:
+        return None
+    if distillation_chunked_jsd is None:
+        return _unsloth_gkd_note_fallback(self, "unsloth_zoo has no distillation_chunked_jsd")
+    if os.environ.get("UNSLOTH_GKD_CHUNKED", "1").lower() in ("0", "false", "no", "off"):
+        return _unsloth_gkd_note_fallback(self, "UNSLOTH_GKD_CHUNKED=0")
+    if getattr(self, "use_liger_gkd_loss", False):
+        return _unsloth_gkd_note_fallback(self, "use_liger_gkd_loss")
+    if getattr(self, "is_fsdp_enabled", False) or getattr(self, "is_deepspeed_enabled", False):
+        return _unsloth_gkd_note_fallback(self, "FSDP / DeepSpeed")
+    try:
+        missing = any(k not in inputs for k in ("input_ids", "attention_mask", "labels"))
+    except Exception:
+        missing = True
+    if missing:
+        return _unsloth_gkd_note_fallback(self, "inputs")
+    if layout["shift"] == "prompt" and "prompts" not in inputs:
+        return _unsloth_gkd_note_fallback(self, "inputs")
+    teacher_model = getattr(self, "teacher_model", None)
+    if teacher_model is None:
+        return _unsloth_gkd_note_fallback(self, "no teacher_model")
+    if not _unsloth_gkd_jsd_supported(type(self)):
+        return _unsloth_gkd_note_fallback(self, "generalized_jsd_loss is not TRL's")
+    try:
+        unwrapped_student = self.accelerator.unwrap_model(model)
+        unwrapped_teacher = self.accelerator.unwrap_model(teacher_model)
+    except Exception:
+        return _unsloth_gkd_note_fallback(self, "unwrap_model")
+    student_head = _unsloth_gkd_dense_head(unwrapped_student)
+    teacher_head = _unsloth_gkd_dense_head(unwrapped_teacher)
+    if student_head is None or teacher_head is None:
+        return _unsloth_gkd_note_fallback(self, "output head is not a dense nn.Linear")
+    if student_head.weight.shape[0] != teacher_head.weight.shape[0]:
+        return _unsloth_gkd_note_fallback(self, "vocab mismatch")
+    # MiniCPM3 divides hidden states by logits_scaling before lm_head; a wrapped forward's hidden_states[-1] predates it.
+    for unwrapped in (unwrapped_student, unwrapped_teacher):
+        for config in _unsloth_text_configs(_unsloth_get_model_config(unwrapped)):
+            if getattr(config, "model_type", None) == "minicpm3":
+                return _unsloth_gkd_note_fallback(
+                    self, "minicpm3 scales hidden states before the head"
+                )
+    # DDP(find_unused_parameters=True) marks a head skipped in forward as unused, then its grad hook fires twice.
+    if getattr(model, "find_unused_parameters", False) and any(
+        p is not None and p.requires_grad for p in (student_head.weight, student_head.bias)
+    ):
+        return _unsloth_gkd_note_fallback(self, "DDP find_unused_parameters with a trainable head")
+
+    prior_hidden_states = os.environ.get("UNSLOTH_RETURN_HIDDEN_STATES")
+    os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = "1"
+    try:
+        student_outputs = model(
+            input_ids = inputs["input_ids"],
+            attention_mask = inputs["attention_mask"],
+        )
+        teacher_model.eval()
+        with torch.no_grad():
+            teacher_outputs = teacher_model(
+                input_ids = inputs["input_ids"],
+                attention_mask = inputs["attention_mask"],
+            )
+    finally:
+        if prior_hidden_states is None:
+            os.environ.pop("UNSLOTH_RETURN_HIDDEN_STATES", None)
+        else:
+            os.environ["UNSLOTH_RETURN_HIDDEN_STATES"] = prior_hidden_states
+
+    student_states = student_outputs.logits
+    teacher_states = teacher_outputs.logits
+    if layout["shift"] == "prompt":
+        prompt_lengths = inputs["prompts"].shape[1]
+        student_states = student_states[:, prompt_lengths - 1 : -1, :]
+        teacher_states = teacher_states[:, prompt_lengths - 1 : -1, :]
+        shifted_labels = inputs["labels"][:, prompt_lengths:]
+    else:
+        student_states = student_states[:, :-1, :]
+        teacher_states = teacher_states[:, :-1, :]
+        shifted_labels = inputs["labels"][:, 1:]
+
+    student_scale, student_softcap = _unsloth_gkd_logit_transforms(unwrapped_student)
+    teacher_scale, teacher_softcap = _unsloth_gkd_logit_transforms(unwrapped_teacher)
+    items = num_items_in_batch if layout["num_items_in_batch"] else None
+
+    student_hidden = _unsloth_grpo_returns_hidden_states(
+        unwrapped_student, student_states, student_head.weight
+    )
+    teacher_hidden = _unsloth_grpo_returns_hidden_states(
+        unwrapped_teacher, teacher_states, teacher_head.weight
+    )
+    if not (student_hidden and teacher_hidden):
+        if student_hidden:
+            student_states = _unsloth_gkd_project(
+                student_states, student_head, student_scale, student_softcap
+            )
+        if teacher_hidden:
+            with torch.no_grad():
+                teacher_states = _unsloth_gkd_project(
+                    teacher_states, teacher_head, teacher_scale, teacher_softcap
+                )
+        _unsloth_gkd_note_fallback(self, "a forward returned logits, not hidden states")
+        # TRL's dense path gets both logits on the input device (accelerate's top-level hook), beside the labels.
+        student_states = student_states.to(shifted_labels.device)
+        teacher_states = teacher_states.to(shifted_labels.device)
+        extra = {}
+        if layout["num_items_in_batch"]:
+            extra["num_items_in_batch"] = num_items_in_batch
+        return self.generalized_jsd_loss(
+            student_logits = student_states,
+            teacher_logits = teacher_states,
+            labels = shifted_labels,
+            beta = self.beta,
+            **extra,
+        )
+
+    # A dispatched model can return hidden states off its head's device; the zoo's accumulators follow the states.
+    student_states = student_states.to(student_head.weight.device)
+    teacher_states = teacher_states.to(teacher_head.weight.device)
+    loss, _entropy_sum, _n_valid = distillation_chunked_jsd(
+        student_states,
+        teacher_states.detach(),
+        student_head.weight,
+        teacher_head.weight.detach(),
+        shifted_labels != -100,
+        beta = float(self.beta),
+        chunk_size = _unsloth_gkd_chunk_size(student_head.weight.shape[0]),
+        num_items_in_batch = items,
+        student_lm_head_bias = student_head.bias,
+        teacher_lm_head_bias = None if teacher_head.bias is None else teacher_head.bias.detach(),
+        student_logit_scale = student_scale,
+        teacher_logit_scale = teacher_scale,
+        student_final_logit_softcapping = student_softcap,
+        teacher_final_logit_softcapping = teacher_softcap,
+        # No TRL release passes a temperature to generalized_jsd_loss (GKDConfig.temperature is for sampling).
+        temperature = 1.0,
+    )
+    try:
+        self._unsloth_gkd_chunked_calls = getattr(self, "_unsloth_gkd_chunked_calls", 0) + 1
+    except Exception:
+        pass
+    return loss
+
+import re
+import inspect
+try:
+    from unsloth_zoo.device_map_planner import detect_logit_transforms
+except Exception:
+    detect_logit_transforms = None
+try:
+    from unsloth_zoo.rl_replacements import distillation_chunked_jsd
+except Exception:
+    distillation_chunked_jsd = None
 @dataclass
 class UnslothGKDConfig(GKDConfig):
     """
@@ -555,7 +1036,7 @@ Args:
         restore_callback_states_from_checkpoint = False,
         full_determinism = False,
         seed = 3407,
-        data_seed = 3407,
+        data_seed = None,
         use_cpu = False,
         accelerator_config = None,
         parallelism_config = None,
@@ -1046,6 +1527,21 @@ class _UnslothGKDTrainer(SFTTrainer):
             return jsd
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # Unsloth: chunked generalized JSD over hidden states; TRL's own loss below is the fallback.
+        if not return_outputs:
+            inputs = _unsloth_gkd_right_align(
+                inputs, {'shift': 'prompt', 'num_items_in_batch': False}, getattr(self, 'use_liger_gkd_loss', False),
+            )
+            loss = _unsloth_gkd_chunked_loss(
+                self, model, inputs, num_items_in_batch, {'shift': 'prompt', 'num_items_in_batch': False},
+            )
+            if loss is not None:
+                return loss
+        return self._unsloth_trl_compute_loss(
+            model, inputs, return_outputs=return_outputs, num_items_in_batch=num_items_in_batch,
+        )
+
+    def _unsloth_trl_compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         if self.use_liger_gkd_loss:
             # Forward only through the base models (avoid lm_head to save memory)
             unwrapped_student = self.accelerator.unwrap_model(model)
@@ -1459,6 +1955,14 @@ Args:
             _pc = getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None)
             if _vllm_tok is not None and _pc is not None and getattr(_pc, 'chat_template', None) is not None and getattr(_vllm_tok, 'chat_template', None) is None:
                 _vllm_tok.chat_template = _pc.chat_template
+        pass
+        if getattr(self, 'aux_loss_enabled', False) and hasattr(getattr(self, 'model', None), 'config'):
+            _text_config = self.model.config
+            if hasattr(_text_config, 'get_text_config'): _text_config = _text_config.get_text_config()
+            _n_experts = [getattr(_text_config, _k) for _k in ('num_local_experts', 'num_experts', 'n_routed_experts', 'moe_num_experts') if isinstance(getattr(_text_config, _k, None), int)]
+            if _n_experts and all(_n == 0 for _n in _n_experts):
+                self.aux_loss_enabled = False
+                _text_config.output_router_logits = False
         pass
         
 pass

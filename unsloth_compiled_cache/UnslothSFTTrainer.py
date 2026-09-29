@@ -1,6 +1,6 @@
 """
-2026.9.7
-2026.9.11
+2026.9.8
+2026.9.12
 5.5.0
 0.24.0
 __UNSLOTH_VERSIONING__
@@ -405,7 +405,8 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -604,7 +605,7 @@ Parameters:
         restore_callback_states_from_checkpoint = False,
         full_determinism = False,
         seed = 3407,
-        data_seed = 3407,
+        data_seed = None,
         use_cpu = False,
         accelerator_config = None,
         parallelism_config = None,
@@ -1906,6 +1907,22 @@ Args:
             _pc = getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None)
             if _vllm_tok is not None and _pc is not None and getattr(_pc, 'chat_template', None) is not None and getattr(_vllm_tok, 'chat_template', None) is None:
                 _vllm_tok.chat_template = _pc.chat_template
+        pass
+        if getattr(self, 'aux_loss_enabled', False) and hasattr(getattr(self, 'model', None), 'config'):
+            _text_config = self.model.config
+            if hasattr(_text_config, 'get_text_config'): _text_config = _text_config.get_text_config()
+            _n_experts = [getattr(_text_config, _k) for _k in ('num_local_experts', 'num_experts', 'n_routed_experts', 'moe_num_experts') if isinstance(getattr(_text_config, _k, None), int)]
+            if _n_experts and all(_n == 0 for _n in _n_experts):
+                self.aux_loss_enabled = False
+                _text_config.output_router_logits = False
+        pass
+        if hasattr(self, 'aux_loss_enabled') and hasattr(getattr(self, 'model', None), 'modules'):
+            for _module in self.model.modules():
+                _config = getattr(_module, 'config', None)
+                if 'router_aux_loss_coef' in vars(_module) and hasattr(_config, 'get_text_config'):
+                    _coef = getattr(_config.get_text_config(), 'router_aux_loss_coef', None)
+                    if _coef is not None:
+                        _module.router_aux_loss_coef = _coef
         pass
         
 pass

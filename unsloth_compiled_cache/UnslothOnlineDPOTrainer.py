@@ -1,6 +1,6 @@
 """
-2026.9.7
-2026.9.11
+2026.9.8
+2026.9.12
 5.5.0
 0.24.0
 __UNSLOTH_VERSIONING__
@@ -30,7 +30,7 @@ from unsloth_zoo.temporary_patches.common import torch_compile
 from unsloth_zoo.temporary_patches.common import _maybe_compile
 import functools
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.online_dpo_trainer import (Any, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, BasePairwiseJudge, BaseTrainer, Callable, DPODataCollatorWithPadding, DataCollator, DataLoader, Dataset, EvalPrediction, F, FSDP, GenerationConfig, IterableDataset, MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES, OnlineDPOConfig, OnlineDPOTrainer, OptimizerNames, Optional, Path, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, RewardFunc, SIMPLE_CHAT_TEMPLATE, Trainer, TrainerCallback, Union, apply_chat_template, broadcast_object_list, create_reference_model, disable_dropout_in_model, empty_cache, gather_object, is_conversational, is_flash_attn_2_available, is_peft_model, jinja2, logger, logging, maybe_apply_chat_template, nn, nullcontext, os, pad, prepare_deepspeed, prepare_fsdp, profiling_context, re, seed_worker, textwrap, torch, truncate_right, unwrap_model_for_generation, version, warnings, wraps, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, BasePairwiseJudge, Callable, DPODataCollatorWithPadding, DataCollator, Dataset, EvalPrediction, F, GenerationConfig, IterableDataset, MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES, OnlineDPOConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, RewardFunc, Trainer, TrainerCallback, Union, create_reference_model, disable_dropout_in_model, logger, nn, os, pad, prepare_deepspeed, prepare_fsdp, re, torch, version, warnings, F, apply_chat_template, is_conversational, re, F, FSDP, is_peft_model, nn, nullcontext, os, re, version, F, PreTrainedModel, Trainer, logger, os, re, torch, F, FSDP, nn, os, re, F, FSDP, nn, re, torch)
+from trl.trainer.online_dpo_trainer import (Any, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, BasePairwiseJudge, BaseTrainer, Callable, DPODataCollatorWithPadding, DataCollator, DataLoader, Dataset, EvalPrediction, F, FSDP, GenerationConfig, IterableDataset, MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES, OnlineDPOConfig, OnlineDPOTrainer, OptimizerNames, Optional, Path, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, RewardFunc, SIMPLE_CHAT_TEMPLATE, Trainer, TrainerCallback, Union, apply_chat_template, broadcast_object_list, create_reference_model, disable_dropout_in_model, empty_cache, gather_object, is_conversational, is_flash_attn_2_available, is_peft_model, jinja2, logger, logging, maybe_apply_chat_template, nn, nullcontext, os, pad, prepare_deepspeed, prepare_fsdp, profiling_context, re, seed_worker, textwrap, torch, truncate_right, unwrap_model_for_generation, version, warnings, wraps, AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer, BasePairwiseJudge, Callable, DPODataCollatorWithPadding, DataCollator, Dataset, EvalPrediction, F, GenerationConfig, IterableDataset, MODEL_FOR_IMAGE_TEXT_TO_TEXT_MAPPING_NAMES, OnlineDPOConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, RewardFunc, Trainer, TrainerCallback, Union, create_reference_model, disable_dropout_in_model, logger, nn, os, pad, prepare_deepspeed, prepare_fsdp, re, torch, version, warnings, pad, re, torch, F, apply_chat_template, is_conversational, re, F, FSDP, is_peft_model, nn, nullcontext, os, re, version, F, PreTrainedModel, Trainer, logger, os, re, torch, F, FSDP, nn, os, re, F, FSDP, nn, re, torch)
 
 
 import os
@@ -405,7 +405,8 @@ def autotune_batch_and_chunks(
 
     if valid_indices.shape[0] == 0:
         #This means your GPU will OOM
-        return 4, final_m
+        # Capped at the row count: unsloth's no-grad pass divides rows by this without max(1, ...).
+        return max(1, min(4, total_input_rows)), final_m
 
     best_idx = valid_indices[0].item()
     final_b = int(b_vals[best_idx].item())
@@ -666,7 +667,7 @@ Parameters:
         restore_callback_states_from_checkpoint = False,
         full_determinism = False,
         seed = 3407,
-        data_seed = 3407,
+        data_seed = None,
         use_cpu = False,
         accelerator_config = None,
         parallelism_config = None,
@@ -1030,6 +1031,8 @@ class _UnslothOnlineDPOTrainer(BaseTrainer):
         if hasattr(model, 'vllm_engine') and hasattr(args, 'use_vllm'):
             if (getattr(args, 'use_vllm', False) == False):
                 args.use_vllm = True
+            if getattr(args, 'top_k', -1) is None or getattr(args, 'top_k', -1) == 0:
+                args.top_k = -1
         if not os.environ.get("TRL_EXPERIMENTAL_SILENCE"):
             warnings.warn(
                 "This trainer will soon be moved to trl.experimental and is a candidate for removal. If you rely on "
@@ -1994,6 +1997,13 @@ class _UnslothOnlineDPOTrainer(BaseTrainer):
                 model_kwargs["image_grid_thw"] = vision_inputs["image_grid_thw"]
 
         # Get the logprobs of the completions from the model
+        _unsloth_left_pad = None
+        if not vision_inputs:
+            _unsloth_left_pad = (prompt_mask == 0).sum(dim = 1)
+            _unsloth_order = torch.argsort(prompt_completion_mask != 0, dim = 1, descending = True, stable = True)
+            prompt_completion_ids = prompt_completion_ids.gather(1, _unsloth_order)
+            prompt_completion_mask = prompt_completion_mask.gather(1, _unsloth_order)
+            model_kwargs["attention_mask"] = prompt_completion_mask
         output = model(prompt_completion_ids, **model_kwargs)
 
         # There is 1 offset, because the model predicts the next token
@@ -2001,7 +2011,21 @@ class _UnslothOnlineDPOTrainer(BaseTrainer):
         start_idx = prompt_len - 1 if prompt_len > 0 else 0
         # Only slice off the last logit when we have a prompt, otherwise we need all logits
         end_idx = -1 if prompt_len > 0 else None
-        logits = output.logits[:, start_idx:end_idx]
+        if _unsloth_left_pad is not None:
+            _unsloth_index = (start_idx - _unsloth_left_pad).unsqueeze(1) + torch.arange(
+                completion_ids.size(1), device = completion_ids.device
+            ).unsqueeze(0)
+            _unsloth_index = _unsloth_index.clamp(0, output.logits.size(1) - 1)
+            _unsloth_rows, _unsloth_len = output.logits.shape[:2]
+            _unsloth_index = _unsloth_index + _unsloth_len * torch.arange(
+                _unsloth_rows, device = _unsloth_index.device
+            ).unsqueeze(1)
+            logits = output.logits.reshape(_unsloth_rows * _unsloth_len, -1).index_select(
+                0, _unsloth_index.reshape(-1)
+            ).view(_unsloth_rows, -1, output.logits.size(-1))
+            output = None
+        else:
+            logits = output.logits[:, start_idx:end_idx]
 
         # Take the completion tokens logprob
         logprobs = torch.take_along_dim(logits.log_softmax(dim=-1), completion_ids.unsqueeze(-1), dim=2).squeeze(-1)
@@ -2586,6 +2610,14 @@ Args:
             _pc = getattr(self, 'processing_class', None) or getattr(self, 'tokenizer', None)
             if _vllm_tok is not None and _pc is not None and getattr(_pc, 'chat_template', None) is not None and getattr(_vllm_tok, 'chat_template', None) is None:
                 _vllm_tok.chat_template = _pc.chat_template
+        pass
+        if getattr(self, 'aux_loss_enabled', False) and hasattr(getattr(self, 'model', None), 'config'):
+            _text_config = self.model.config
+            if hasattr(_text_config, 'get_text_config'): _text_config = _text_config.get_text_config()
+            _n_experts = [getattr(_text_config, _k) for _k in ('num_local_experts', 'num_experts', 'n_routed_experts', 'moe_num_experts') if isinstance(getattr(_text_config, _k, None), int)]
+            if _n_experts and all(_n == 0 for _n in _n_experts):
+                self.aux_loss_enabled = False
+                _text_config.output_router_logits = False
         pass
         
 pass
