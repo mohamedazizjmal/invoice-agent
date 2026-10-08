@@ -1,6 +1,6 @@
 """
-2026.9.8
-2026.9.12
+2026.9.9
+2026.9.14
 5.5.0
 0.24.0
 __UNSLOTH_VERSIONING__
@@ -30,7 +30,7 @@ from unsloth_zoo.temporary_patches.common import torch_compile
 from unsloth_zoo.temporary_patches.common import _maybe_compile
 import functools
 from typing import Any, List, Optional, Tuple, Union, Dict, Set, Callable
-from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, empty_cache, nn, os, prepare_deepspeed, random, textwrap, torch, unwrap_model_for_generation, warnings, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, nn, os, prepare_deepspeed, torch, warnings, F, empty_cache, os, torch)
+from trl.trainer.gkd_trainer import (Any, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GKDTrainer, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, empty_cache, nn, os, prepare_deepspeed, random, textwrap, torch, unwrap_model_for_generation, warnings, AutoModelForCausalLM, BaseImageProcessor, Callable, DataCollator, DataCollatorForChatML, Dataset, EvalPrediction, F, FeatureExtractionMixin, GKDConfig, GenerationConfig, Optional, PeftConfig, PreTrainedModel, PreTrainedTokenizerBase, ProcessorMixin, SFTTrainer, TrainerCallback, Union, disable_dropout_in_model, nn, os, prepare_deepspeed, torch, warnings, F, empty_cache, os, torch, torch)
 
 
 import os
@@ -191,8 +191,20 @@ def chunked_hidden_states_selective_log_softmax(
         chunks = max(chunks, -(-n_rows // max_rows_per_chunk))
         chunks = min(chunks, max(n_rows, 1))
 
-    chunked_hidden_states = torch.chunk(flat_hidden_states, chunks=chunks, dim=0)
-    chunked_index = torch.chunk(flat_index, chunks=chunks, dim=0)
+    # A one-row chunk's head gradient is a K=1 matmul Inductor mis-lowers under dynamic shapes (illegal
+    # memory access or NaN head gradients, torch 2.13), so keep chunks at 2+ rows when the head trains.
+    lm_head_grad = torch.is_grad_enabled() and lm_head.requires_grad
+    if lm_head_grad and chunks >= flat_hidden_states.shape[0]:
+        chunks = max(flat_hidden_states.shape[0] // 2, 1)
+
+    chunked_hidden_states = list(torch.chunk(flat_hidden_states, chunks=chunks, dim=0))
+    chunked_index = list(torch.chunk(flat_index, chunks=chunks, dim=0))
+    if lm_head_grad and len(chunked_hidden_states) > 1 and chunked_hidden_states[-1].shape[0] == 1:
+        # Re-split with the previous chunk: max_rows_per_chunk then only breaks for a cap of 2 over odd rows.
+        for chunked in (chunked_hidden_states, chunked_index):
+            pair = torch.cat(chunked[-2:])
+            half = (pair.shape[0] + 1) // 2
+            chunked[-2:] = [pair[:half], pair[half:]] if pair.shape[0] >= 4 else [pair]
 
     all_per_token_logps = []
 
@@ -1120,6 +1132,9 @@ Args:
                 from unsloth_zoo.flex_attention import FLEX_ATTENTION_BLOCK_SIZE
                 pad_to_multiple_of = FLEX_ATTENTION_BLOCK_SIZE
         
+        if eval_steps is not None and eval_strategy != 'steps':
+            print(f'Unsloth: `eval_steps = {eval_steps}` is ignored because `eval_strategy` is {getattr(eval_strategy, "value", eval_strategy)!r}. Set `eval_strategy = "steps"` to evaluate every `eval_steps` steps.')
+        
         if temperature <= 0:
             raise ValueError('Unsloth: Please set a positive non-zero temperature since your results will be wrong.')
         elif temperature >= 10:
@@ -1650,6 +1665,7 @@ class _UnslothGKDTrainer(SFTTrainer):
         # Calculate new attention mask
         new_attention_mask = torch.ones_like(generated_tokens)
         new_labels = generated_tokens.clone()
+        new_labels[:, : inputs["prompts"].shape[1]] = -100
 
         # If there's pad_token_id, set attention mask to 0 for padding tokens
         if pad_token_id is not None:
@@ -1821,7 +1837,8 @@ Args:
                       '`pip install --upgrade --no-cache-dir --force-reinstall --no-deps unsloth transformers trl unsloth_zoo`')
         if getattr(args, 'eval_strategy', 'no') != 'no':
             eval_bsz = getattr(args, 'per_device_eval_batch_size', 8)
-            if eval_bsz == 8 and args.per_device_train_batch_size < eval_bsz: args.per_device_eval_batch_size = args.per_device_train_batch_size
+            eval_generations = getattr(args, 'num_generations_eval', None) or getattr(args, 'num_generations', None) or 1
+            if eval_bsz == 8 and args.per_device_train_batch_size < eval_bsz and (args.per_device_train_batch_size * args.world_size) % eval_generations == 0: args.per_device_eval_batch_size = args.per_device_train_batch_size
             if getattr(args, 'eval_accumulation_steps', None) is None and ga_steps is not None: args.eval_accumulation_steps = ga_steps
         fp16_full_eval = getattr(args, 'fp16_full_eval', False)
         if type(fp16_full_eval) is not bool: fp16_full_eval = False
@@ -1964,5 +1981,9 @@ Args:
                 self.aux_loss_enabled = False
                 _text_config.output_router_logits = False
         pass
+        if getattr(self, 'liger_jsd_loss', None) is not None:
+            self.liger_jsd_loss.weight_hard_loss = 0.0
+            self.liger_jsd_loss.weight_soft_loss = 1.0
+            self.liger_jsd_loss.temperature = 1.0
         
 pass

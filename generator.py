@@ -74,6 +74,37 @@ AR_PRODUCTS = [
     "علبة براغي ستانلس 6x40",
 ]
 
+
+# --------------------------------------------------------------------------
+# Out-of-distribution vocabulary: entirely disjoint from the pools above,
+# used ONLY to build a genuinely held-out generalization test set.
+# --------------------------------------------------------------------------
+
+FR_COMPANY_NAMES_OOD = [
+    "Manufacture Centrale du Textile", "Horizon Plastique Industrie",
+    "Les Ateliers Réunis de Kairouan", "Comptoir National des Métaux",
+    "Société Atlas Chimie", "Groupe Phénix Construction",
+    "Dépôt Général Boukhris", "Union Technique du Froid",
+]
+
+AR_COMPANY_NAMES_OOD = [
+    "شركة الأطلس للصناعات", "مؤسسة النجمة الزرقاء للتجارة",
+    "الشركة القيروانية للنسيج", "مصنع الفينيق للبلاستيك",
+    "مؤسسة الواحة للخدمات", "شركة الجوهرة للتوزيع",
+]
+
+FR_PRODUCTS_OOD = [
+    "Rouleau de tissu polyester", "Moteur électrique monophasé",
+    "Palette de briques réfractaires", "Groupe électrogène 5kVA",
+    "Kit de soudure à l'arc", "Bidon d'huile hydraulique 20L",
+]
+
+AR_PRODUCTS_OOD = [
+    "لفة قماش بوليستر", "محرك كهربائي أحادي الطور",
+    "منصة طوب حراري", "مولد كهربائي 5 كيلوفولت أمبير",
+    "طقم لحام بالقوس", "برميل زيت هيدروليكي 20 لتر",
+]
+
 VAT_RATES = [0.19, 0.13, 0.07, 0.0]
 VAT_WEIGHTS = [0.55, 0.20, 0.20, 0.05]  # 19% is the standard/most common rate
 
@@ -126,8 +157,11 @@ def _reshape_note():
 # Core generation
 # --------------------------------------------------------------------------
 
-def _gen_line_items(lang, n_items):
-    pool = AR_PRODUCTS if lang == "ar" else FR_PRODUCTS
+def _gen_line_items(lang, n_items, ood=False):
+    if ood:
+        pool = AR_PRODUCTS_OOD if lang == "ar" else FR_PRODUCTS_OOD
+    else:
+        pool = AR_PRODUCTS if lang == "ar" else FR_PRODUCTS
     items = []
     for _ in range(n_items):
         desc = random.choice(pool)
@@ -143,7 +177,7 @@ def _gen_line_items(lang, n_items):
     return items
 
 
-def generate_record(record_id, lang):
+def generate_record(record_id, lang, ood=False):
     """
     lang: "fr" | "ar" | "mixed"
       - "fr": French vendor, French products, French boilerplate
@@ -153,7 +187,10 @@ def generate_record(record_id, lang):
         Arabic) with Arabic vendor + Arabic product descriptions
     """
     is_ar_vendor = lang in ("ar", "mixed")
-    vendor = random.choice(AR_COMPANY_NAMES if is_ar_vendor else FR_COMPANY_NAMES)
+    if ood:
+        vendor = random.choice(AR_COMPANY_NAMES_OOD if is_ar_vendor else FR_COMPANY_NAMES_OOD)
+    else:
+        vendor = random.choice(AR_COMPANY_NAMES if is_ar_vendor else FR_COMPANY_NAMES)
     city, postal = random.choice(CITIES_AR if is_ar_vendor else CITIES)
 
     invoice_date = _rand_date()
@@ -163,7 +200,7 @@ def generate_record(record_id, lang):
 
     items_lang = "ar" if lang in ("ar", "mixed") else "fr"
     n_items = random.randint(1, 5)
-    items = _gen_line_items(items_lang, n_items)
+    items = _gen_line_items(items_lang, n_items, ood=ood)
 
     subtotal = round(sum(i["line_total"] for i in items), 3)
     vat_rate = random.choices(VAT_RATES, weights=VAT_WEIGHTS, k=1)[0]
@@ -324,7 +361,7 @@ def render_ocr_text(labels, lang, city, postal):
 # Dataset assembly + CLI
 # --------------------------------------------------------------------------
 
-def build_dataset(n, fr_ratio, ar_ratio, mixed_ratio, noise_level, seed):
+def build_dataset(n, fr_ratio, ar_ratio, mixed_ratio, noise_level, seed, ood=False):
     random.seed(seed)
     total = fr_ratio + ar_ratio + mixed_ratio
     fr_ratio, ar_ratio, mixed_ratio = (fr_ratio / total, ar_ratio / total, mixed_ratio / total)
@@ -332,9 +369,10 @@ def build_dataset(n, fr_ratio, ar_ratio, mixed_ratio, noise_level, seed):
     langs = random.choices(
         ["fr", "ar", "mixed"], weights=[fr_ratio, ar_ratio, mixed_ratio], k=n
     )
+    prefix = "ood_inv" if ood else "inv"
     records = []
     for i, lang in enumerate(langs):
-        rec = generate_record(record_id=f"inv_{i:05d}", lang=lang)
+        rec = generate_record(record_id=f"{prefix}_{i:05d}", lang=lang, ood=ood)
         if noise_level > 0:
             rec["ocr_text"] = inject_ocr_noise(rec["ocr_text"], noise_level)
         records.append(rec)
