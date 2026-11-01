@@ -3,7 +3,7 @@
   "model": "unsloth/Qwen3-8B",
   "input": "real Tesseract OCR text (PSM 6, fra+ara)",
   "n_examples": 92,
-  "timestamp": "2026-11-01T18:32:37.535929+00:00",
+  "timestamp": "2026-11-01T20:27:56.523849+00:00",
   "summary": {
     "invoice_number": {
       "precision": 0.6477272727272727,
